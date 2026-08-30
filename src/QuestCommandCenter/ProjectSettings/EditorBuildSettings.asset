@@ -1,0 +1,14 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1045 &1
+EditorBuildSettings:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Scenes:
+  - enabled: 1
+    path: Assets/QuestCommandCenter/Scenes/QuestShell.unity
+    guid: 73a257be9faf3f09bbfd5e450a8b33d9
+  m_configObjects:
+    com.unity.xr.arfoundation.simulation_settings: {fileID: 11400000, guid: b757fb21b7743dcaca1e984381d289de, type: 2}
+    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 367bf735aa397b7b3a134a43c82d7508, type: 2}
+    com.unity.xr.openxr.settings4: {fileID: 11400000, guid: 923bb25e4e46de58aac743cd49bcdea4, type: 2}

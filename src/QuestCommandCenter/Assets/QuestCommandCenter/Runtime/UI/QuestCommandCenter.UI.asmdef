@@ -1,0 +1,9 @@
+{
+  "name": "QuestCommandCenter.UI",
+  "rootNamespace": "QuestCommandCenter.UI",
+  "references": [
+    "QuestCommandCenter.VehicleCore",
+    "QuestCommandCenter.Video",
+    "UnityEngine.UI"
+  ]
+}

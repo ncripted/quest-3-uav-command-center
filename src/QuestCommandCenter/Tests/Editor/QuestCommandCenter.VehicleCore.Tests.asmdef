@@ -1,0 +1,13 @@
+{
+  "name": "QuestCommandCenter.VehicleCore.Tests",
+  "rootNamespace": "QuestCommandCenter.VehicleCore.Tests",
+  "references": [
+    "QuestCommandCenter.VehicleCore"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ]
+}

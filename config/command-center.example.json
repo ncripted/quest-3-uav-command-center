@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "vehicle": {
+    "adapter": "mock",
+    "displayName": "Mock Spark"
+  },
+  "control": {
+    "manualDeadmanControl": "rightGripHold",
+    "manualTakeoverControl": "leftGrip",
+    "cameraModifierControl": "leftTrigger",
+    "uiSelectControl": "rightTrigger",
+    "rthRequestControl": "holdYThenConfirmA",
+    "brakeHoverControl": "B",
+    "controllerStaleTimeoutMs": 150,
+    "commandTimeoutMs": 250,
+    "manualTakeoverMissionPolicy": "pause"
+  },
+  "safetyProfile": {
+    "name": "indoor-development",
+    "maxHorizontalCommand": 0.35,
+    "maxVerticalCommand": 0.25,
+    "maxYawCommand": 0.30,
+    "maxHorizontalMetersPerSecond": 0.5,
+    "maxVerticalMetersPerSecond": 0.3,
+    "maxYawDegreesPerSecond": 20.0,
+    "maxRelativeAltitudeMeters": 2.0,
+    "maxRadiusFromHomeMeters": 10.0,
+    "lowBatteryPercent": 30,
+    "criticalBatteryPercent": 20,
+    "telemetryWarningTimeoutMs": 500,
+    "telemetryFailsafeTimeoutMs": 1000,
+    "allowAutopilotWithoutValidGps": false,
+    "allowRthIndoors": false
+  },
+  "recording": {
+    "enabled": true,
+    "sessionRoot": "FlightSessions",
+    "telemetryFormat": "jsonl",
+    "eventFormat": "jsonl"
+  },
+  "dji": {
+    "backend": "local",
+    "msdkVersion": "4.18",
+    "androidPackageName": "com.dronecommand.quest",
+    "appKeySource": "environment:DJI_MSDK_APP_KEY",
+    "bridge": {
+      "host": "192.168.0.2",
+      "controlPort": 7443,
+      "videoPort": 5600
+    }
+  },
+  "mock": {
+    "randomSeed": 20260825,
+    "telemetryRateHz": 10,
+    "commandRateHz": 20,
+    "initialBatteryPercent": 100,
+    "homeLatitude": 42.3314,
+    "homeLongitude": -83.0458,
+    "failureScenario": "none"
+  }
+}

@@ -1,0 +1,63 @@
+# Unity generated state
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+MemoryCaptures/
+Recordings/
+[Bb]urstDebugInformation_DoNotShip/
+TestResults/
+sysinfo.txt
+
+# IDE/editor files
+.idea/
+.vscode/
+*.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.log
+*.tmp
+*.bak
+
+# Android/Gradle generated state
+.gradle/
+**/build/
+**/.deps/
+local.properties
+*.apk
+*.aab
+*.unitypackage
+
+# Credentials and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pem
+secrets/
+config/command-center.json
+config/*.local.json
+
+# Local agent/session metadata
+.agents/
+.codex/
+
+# Python simulator caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Flight-session data must remain local
+FlightSession/
+FlightSessions/
+
+# OS noise
+.DS_Store
+Thumbs.db

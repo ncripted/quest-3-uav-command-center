@@ -1,0 +1,15 @@
+{
+  "name": "QuestCommandCenter.VehicleCore.Tests",
+  "rootNamespace": "QuestCommandCenter.VehicleCore.Tests",
+  "references": [
+    "QuestCommandCenter.Adapters.DjiSpark",
+    "QuestCommandCenter.DesktopSimulator",
+    "QuestCommandCenter.VehicleCore"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ]
+}

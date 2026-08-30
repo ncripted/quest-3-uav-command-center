@@ -1,0 +1,24 @@
+{
+  "name": "QuestCommandCenter.Editor",
+  "rootNamespace": "QuestCommandCenter.Editor",
+  "references": [
+    "QuestCommandCenter.Adapters.DjiSpark",
+    "QuestCommandCenter.DesktopSimulator",
+    "QuestCommandCenter.UI",
+    "QuestCommandCenter.VehicleCore",
+    "QuestCommandCenter.XRInput",
+    "Unity.InputSystem",
+    "Unity.XR.ARFoundation",
+    "Unity.XR.CoreUtils",
+    "Unity.XR.Management",
+    "Unity.XR.Management.Editor",
+    "Unity.XR.OpenXR",
+    "Unity.XR.OpenXR.Editor",
+    "Unity.XR.MetaOpenXR",
+    "Unity.XR.OpenXR.Features.MetaQuestSupport",
+    "UnityEngine.UI"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ]
+}

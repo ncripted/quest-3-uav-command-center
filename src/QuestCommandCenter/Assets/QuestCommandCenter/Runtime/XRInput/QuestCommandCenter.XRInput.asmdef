@@ -1,0 +1,8 @@
+{
+  "name": "QuestCommandCenter.XRInput",
+  "rootNamespace": "QuestCommandCenter.XRInput",
+  "references": [
+    "QuestCommandCenter.VehicleCore",
+    "Unity.InputSystem"
+  ]
+}

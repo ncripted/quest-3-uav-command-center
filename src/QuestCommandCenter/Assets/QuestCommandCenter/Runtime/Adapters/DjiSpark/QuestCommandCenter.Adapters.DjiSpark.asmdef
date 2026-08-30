@@ -1,0 +1,8 @@
+{
+  "name": "QuestCommandCenter.Adapters.DjiSpark",
+  "rootNamespace": "QuestCommandCenter.Adapters.DjiSpark",
+  "references": [
+    "QuestCommandCenter.VehicleCore",
+    "QuestCommandCenter.Video"
+  ]
+}

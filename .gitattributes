@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+*.cs text diff=csharp
+*.java text diff=java
+*.json text
+*.md text
+*.shader text
+*.unity text eol=lf
+*.prefab text eol=lf
+*.asset text eol=lf
+*.meta text eol=lf
+
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary

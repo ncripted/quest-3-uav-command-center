@@ -1,0 +1,9 @@
+{
+  "name": "QuestCommandCenter.DesktopSimulator",
+  "rootNamespace": "QuestCommandCenter.DesktopSimulator",
+  "references": [
+    "QuestCommandCenter.VehicleCore",
+    "Unity.InputSystem",
+    "UnityEngine.UI"
+  ]
+}
