@@ -220,14 +220,17 @@ namespace QuestCommandCenter.XRInput
 
         private void UpdatePreflight(bool telemetryFresh)
         {
-            var controllerNeutral = !latestIntent.ManualFlightAuthorized
-                && CommandIsNeutral(latestIntent.Command);
+            // The deliberate unlock chord includes the right-grip dead-man. Only
+            // the stick axes belong in this preflight check; TryAdvancePreflight
+            // separately requires the operator to release the chord before the
+            // adapter is allowed to enable manual control.
+            var controllerAxesNeutral = CommandIsNeutral(latestIntent.Command);
             preflightResult = preflightGate.Evaluate(new FlightPreflightInput
             {
                 Telemetry = liveTelemetry,
                 TelemetryFresh = telemetryFresh,
                 ManualControlInterfaceReady = manualControl?.IsManualControlInterfaceReady == true,
-                ControllerNeutral = controllerNeutral
+                ControllerAxesNeutral = controllerAxesNeutral
             });
 
             if (!preflightResult.Passed)
@@ -356,6 +359,11 @@ namespace QuestCommandCenter.XRInput
                     unlockHoldCompleted = true;
                     Debug.LogWarning(
                         "Outdoor preflight acknowledgement received; waiting for control release.");
+                }
+                else
+                {
+                    Debug.LogWarning(
+                        "Flight-control unlock hold ignored because live preflight is not complete.");
                 }
                 return;
             }

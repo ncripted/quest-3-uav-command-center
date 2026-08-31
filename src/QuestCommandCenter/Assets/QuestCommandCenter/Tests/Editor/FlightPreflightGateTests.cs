@@ -40,16 +40,16 @@ namespace QuestCommandCenter.VehicleCore.Tests
         }
 
         [Test]
-        public void HeldDeadmanOrNonNeutralInput_BlocksPreflight()
+        public void NonNeutralStickInput_BlocksPreflight()
         {
             var input = ReadyInput();
-            input.ControllerNeutral = false;
+            input.ControllerAxesNeutral = false;
 
             var result = new FlightPreflightGate().Evaluate(input);
 
             Assert.That(result.Passed, Is.False);
             Assert.That(result.Checks, Has.Some.Matches<FlightPreflightCheck>(
-                check => check.Label == "CONTROLLERS" && !check.Passed));
+                check => check.Label == "CONTROLLER STICKS" && !check.Passed));
         }
 
         [Test]
@@ -101,7 +101,7 @@ namespace QuestCommandCenter.VehicleCore.Tests
             {
                 TelemetryFresh = true,
                 ManualControlInterfaceReady = true,
-                ControllerNeutral = true,
+                ControllerAxesNeutral = true,
                 Telemetry = new VehicleTelemetry
                 {
                     IsConnected = true,

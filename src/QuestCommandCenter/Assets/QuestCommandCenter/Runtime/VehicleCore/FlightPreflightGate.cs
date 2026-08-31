@@ -9,7 +9,7 @@ namespace QuestCommandCenter.VehicleCore
         public VehicleTelemetry Telemetry { get; set; }
         public bool TelemetryFresh { get; set; }
         public bool ManualControlInterfaceReady { get; set; }
-        public bool ControllerNeutral { get; set; }
+        public bool ControllerAxesNeutral { get; set; }
     }
 
     public sealed class FlightPreflightCheck
@@ -87,8 +87,8 @@ namespace QuestCommandCenter.VehicleCore
                     input.ManualControlInterfaceReady
                         ? "READY / ENABLES AFTER CONFIRM"
                         : "STATUS QUERY FAILED"),
-                Check("CONTROLLERS", input.ControllerNeutral,
-                    input.ControllerNeutral ? "NEUTRAL / DEAD-MAN RELEASED" : "RELEASE GRIP / CENTER STICKS")
+                Check("CONTROLLER STICKS", input.ControllerAxesNeutral,
+                    input.ControllerAxesNeutral ? "CENTERED" : "CENTER BOTH STICKS")
             });
         }
 

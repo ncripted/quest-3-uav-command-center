@@ -46,8 +46,8 @@ on-headset preflight is completed, the real adapter. Takeoff uses both sticks he
 down and inward; X hold requests RTH, A hold requests landing, B is brake/hover,
 right grip is the movement dead-man, and left grip requests takeover. Real control
 cannot unlock until fresh telemetry, battery, GPS/home, failsafe, grounded-state,
-Virtual Stick, and neutral-controller checks pass, followed by a deliberate
-three-second confirmation and control release.
+Virtual Stick, and centered-stick checks pass, followed by a deliberate
+three-second both-grips-plus-A confirmation and control release.
 
 The first integrated Milestone 6 slice is implemented. An explicit control-mode
 state machine, single-authority command arbiter, timestamped command envelopes,
