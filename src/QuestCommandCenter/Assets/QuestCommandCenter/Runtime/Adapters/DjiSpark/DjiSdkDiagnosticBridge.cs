@@ -24,6 +24,8 @@ namespace QuestCommandCenter.Adapters.DjiSpark
         private const double VideoPollIntervalSeconds = 0.1;
         private const double GimbalTelemetryMaximumAgeSeconds = 0.5;
         private const double FlightActionTelemetryMaximumAgeSeconds = 0.5;
+        private const double VirtualStickRequestTimeoutSeconds = 4.0;
+        private const double VirtualStickStatusProbeRetrySeconds = 2.0;
 #if UNITY_ANDROID && !UNITY_EDITOR
         private const string GroundedNeutralTestIntentExtra =
             "com.dronecommand.quest.DJI_GROUNDED_NEUTRAL_TEST";
@@ -60,7 +62,14 @@ namespace QuestCommandCenter.Adapters.DjiSpark
         private bool virtualStickStatusKnown;
         private bool virtualStickAvailable;
         private bool virtualStickEnabled;
+        private bool virtualStickHasError;
         private string virtualStickMessage = "Read-only compatibility probe pending.";
+        private string virtualStickPendingOperation = string.Empty;
+        private long virtualStickActiveRequestId;
+        private long virtualStickLastCompletedRequestId;
+        private double virtualStickRequestStartedAt;
+        private double virtualStickRequestDeadline;
+        private double nextVirtualStickStatusProbeAt;
 #if UNITY_ANDROID && !UNITY_EDITOR
         private bool groundedNeutralTestRequested;
         private bool groundedNeutralTestStarted;
@@ -98,6 +107,8 @@ namespace QuestCommandCenter.Adapters.DjiSpark
         // both the enabled state and DJI's post-enable availability result.
         public bool IsManualControlInterfaceReady => virtualStickStatusKnown;
         public bool IsManualControlEnabled => virtualStickEnabled && virtualStickAvailable;
+        public string ManualControlStatusMessage => virtualStickMessage;
+        public bool HasManualControlError => virtualStickHasError;
 
         public event Action<string> StatusChanged;
         public event Action<Texture> VideoFrameUpdated;
@@ -135,12 +146,14 @@ namespace QuestCommandCenter.Adapters.DjiSpark
             PollVideoFrame();
 #endif
 
+            var now = Time.realtimeSinceStartupAsDouble;
+            UpdateVirtualStickRequestHealth(now);
+
             if (!productConnected || telemetryReceiveCount == 0)
             {
                 return;
             }
 
-            var now = Time.realtimeSinceStartupAsDouble;
             var ageSeconds = now - lastTelemetryReceivedAt;
             if (ageSeconds > 1.0 && !telemetryStale)
             {
@@ -158,6 +171,16 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 LogTelemetryHealth(now, "periodic");
                 nextTelemetryHealthLogAt = now + 30.0;
             }
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (!virtualStickStatusKnown
+                && !virtualStickStatusRequestPending
+                && IsFlightTelemetryFresh()
+                && now >= nextVirtualStickStatusProbeAt)
+            {
+                RequestVirtualStickStatusProbe();
+            }
+#endif
         }
 
         private void OnDestroy()
@@ -293,9 +316,19 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 case "virtual_stick_safety_disabled":
                     {
                         var wasManualControlEnabled = virtualStickEnabled;
+                        virtualStickLastCompletedRequestId = Math.Max(
+                            virtualStickLastCompletedRequestId,
+                            virtualStickActiveRequestId);
                         virtualStickStatusRequestPending = false;
+                        virtualStickActiveRequestId = 0;
+                        virtualStickPendingOperation = string.Empty;
                         virtualStickEnabled = false;
-                        virtualStickStatusKnown = sdkEvent.ok;
+                        virtualStickAvailable = false;
+                        // A safety disable result is not a read-only API probe.
+                        // Preserve previously established API reachability so the
+                        // operator can correct the cause and deliberately retry.
+                        virtualStickStatusKnown = virtualStickStatusKnown || sdkEvent.ok;
+                        virtualStickHasError = true;
                         virtualStickMessage = diagnosticMessage;
                         if (wasManualControlEnabled)
                         {
@@ -435,8 +468,10 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 return false;
             }
 
-            virtualStickStatusRequestPending = true;
             var requestId = ++virtualStickRequestSequence;
+            BeginVirtualStickRequest(requestId, "query");
+            nextVirtualStickStatusProbeAt = Time.realtimeSinceStartupAsDouble
+                + VirtualStickStatusProbeRetrySeconds;
             try
             {
                 var accepted = androidBridge.CallStatic<bool>("queryVirtualStickStatus", requestId);
@@ -444,17 +479,19 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 {
                     return true;
                 }
-                virtualStickStatusRequestPending = false;
-                virtualStickMessage = "Flight controller unavailable for read-only probe.";
-                RenderStatus();
+                FailVirtualStickRequestLocally(
+                    requestId,
+                    "query",
+                    "Flight controller unavailable for read-only Virtual Stick probe.");
                 return false;
             }
             catch (Exception exception)
             {
-                virtualStickStatusRequestPending = false;
-                virtualStickMessage = "Virtual Stick probe failed: " + exception.GetType().Name;
+                FailVirtualStickRequestLocally(
+                    requestId,
+                    "query",
+                    "Virtual Stick probe failed: " + exception.GetType().Name);
                 Debug.LogError("DJI Virtual Stick status probe failed: " + exception);
-                RenderStatus();
                 return false;
             }
 #else
@@ -477,11 +514,17 @@ namespace QuestCommandCenter.Adapters.DjiSpark
             if (enabled
                 && (!IsFlightTelemetryFresh() || LatestTelemetry.FailsafeEnabled))
             {
+                virtualStickHasError = true;
+                virtualStickMessage =
+                    "Virtual Stick enable rejected: telemetry is older than 500 ms or DJI failsafe is active.";
+                Debug.LogError(virtualStickMessage);
+                RenderStatus();
                 return false;
             }
 
-            virtualStickStatusRequestPending = true;
             var requestId = ++virtualStickRequestSequence;
+            var operation = enabled ? "enable" : "disable";
+            BeginVirtualStickRequest(requestId, operation);
             try
             {
                 var accepted = androidBridge.CallStatic<bool>(
@@ -492,12 +535,19 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 {
                     return true;
                 }
-                virtualStickStatusRequestPending = false;
+                FailVirtualStickRequestLocally(
+                    requestId,
+                    operation,
+                    "DJI flight controller rejected the Virtual Stick " + operation
+                        + " request before dispatch.");
                 return false;
             }
             catch (Exception exception)
             {
-                virtualStickStatusRequestPending = false;
+                FailVirtualStickRequestLocally(
+                    requestId,
+                    operation,
+                    "Virtual Stick " + operation + " failed: " + exception.GetType().Name);
                 Debug.LogError("DJI Virtual Stick mode request failed: " + exception);
                 return false;
             }
@@ -557,6 +607,75 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 authorized);
         }
 
+        private void BeginVirtualStickRequest(long requestId, string operation)
+        {
+            virtualStickStatusRequestPending = true;
+            virtualStickActiveRequestId = requestId;
+            virtualStickPendingOperation = operation ?? string.Empty;
+            virtualStickRequestStartedAt = Time.realtimeSinceStartupAsDouble;
+            virtualStickRequestDeadline = virtualStickRequestStartedAt
+                + VirtualStickRequestTimeoutSeconds;
+        }
+
+        private void FailVirtualStickRequestLocally(
+            long requestId,
+            string operation,
+            string message)
+        {
+            if (virtualStickActiveRequestId != 0
+                && requestId != virtualStickActiveRequestId)
+            {
+                return;
+            }
+
+            virtualStickStatusRequestPending = false;
+            virtualStickLastCompletedRequestId = Math.Max(
+                virtualStickLastCompletedRequestId,
+                requestId);
+            virtualStickActiveRequestId = 0;
+            virtualStickPendingOperation = string.Empty;
+            virtualStickRequestDeadline = 0.0;
+            virtualStickHasError = true;
+            virtualStickMessage = message ?? "Unknown Virtual Stick request error.";
+
+            if (string.Equals(operation, "query", StringComparison.Ordinal))
+            {
+                virtualStickStatusKnown = false;
+            }
+            else
+            {
+                virtualStickAvailable = false;
+                virtualStickEnabled = false;
+                ManualControlModeChanged?.Invoke(false);
+            }
+
+            Debug.LogError(
+                "DJI Virtual Stick " + operation + " request " + requestId
+                + " failed locally: " + virtualStickMessage);
+            RenderStatus();
+        }
+
+        private void UpdateVirtualStickRequestHealth(double now)
+        {
+            if (!virtualStickStatusRequestPending
+                || virtualStickActiveRequestId <= 0
+                || now <= virtualStickRequestDeadline)
+            {
+                return;
+            }
+
+            var requestId = virtualStickActiveRequestId;
+            var operation = virtualStickPendingOperation;
+            var elapsedMilliseconds = Math.Max(
+                0.0,
+                (now - virtualStickRequestStartedAt) * 1000.0);
+            FailVirtualStickRequestLocally(
+                requestId,
+                operation,
+                "Virtual Stick " + operation + " callback timed out after "
+                    + elapsedMilliseconds.ToString("0", CultureInfo.InvariantCulture) + " ms.");
+        }
+
         // Called by the Android bridge through UnityPlayer.UnitySendMessage.
         public void OnDjiVirtualStickStatus(string json)
         {
@@ -567,16 +686,77 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 return;
             }
 
+            if ((virtualStickActiveRequestId > 0
+                    && dto.requestId != virtualStickActiveRequestId)
+                || (virtualStickActiveRequestId == 0
+                    && dto.requestId <= virtualStickLastCompletedRequestId))
+            {
+                Debug.LogWarning(
+                    "Ignoring stale DJI Virtual Stick callback for request "
+                    + dto.requestId + ".");
+                return;
+            }
+
+            var operation = string.IsNullOrEmpty(dto.operation)
+                ? virtualStickPendingOperation
+                : dto.operation;
+            var callbackLatencyMilliseconds = virtualStickRequestStartedAt <= 0.0
+                ? 0.0
+                : Math.Max(
+                    0.0,
+                    (Time.realtimeSinceStartupAsDouble - virtualStickRequestStartedAt) * 1000.0);
             virtualStickStatusRequestPending = false;
-            virtualStickStatusKnown = dto.succeeded;
+            virtualStickLastCompletedRequestId = Math.Max(
+                virtualStickLastCompletedRequestId,
+                dto.requestId);
+            virtualStickActiveRequestId = 0;
+            virtualStickPendingOperation = string.Empty;
+            virtualStickRequestDeadline = 0.0;
+            if (string.Equals(operation, "query", StringComparison.Ordinal))
+            {
+                virtualStickStatusKnown = dto.succeeded;
+            }
+            else if (string.Equals(operation, "enable", StringComparison.Ordinal)
+                || string.Equals(operation, "disable", StringComparison.Ordinal))
+            {
+                // A mode-change callback proves the API is reachable even when
+                // DJI rejects the requested state. Do not turn an enable failure
+                // into a false read-only status-query failure.
+                virtualStickStatusKnown = true;
+            }
+            else
+            {
+                virtualStickStatusKnown = dto.succeeded;
+            }
             virtualStickAvailable = dto.available;
             virtualStickEnabled = dto.enabled;
+            virtualStickHasError = !dto.succeeded;
             virtualStickMessage = dto.message ?? string.Empty;
             ManualControlModeChanged?.Invoke(IsManualControlEnabled);
-            Debug.Log(
-                "DJI Virtual Stick status: available=" + dto.available
+            var statusLog =
+                "DJI Virtual Stick result: requestId=" + dto.requestId
+                + ", operation=" + operation
+                + ", latencyMs="
+                + callbackLatencyMilliseconds.ToString("0", CultureInfo.InvariantCulture)
+                + ", available=" + dto.available
                 + ", enabled=" + dto.enabled
-                + ", succeeded=" + dto.succeeded);
+                + ", succeeded=" + dto.succeeded
+                + ", telemetryAgeMs="
+                + (telemetryReceiveCount <= 0
+                    ? "unknown"
+                    : Math.Max(
+                        0.0,
+                        (Time.realtimeSinceStartupAsDouble - lastTelemetryReceivedAt) * 1000.0)
+                        .ToString("0", CultureInfo.InvariantCulture))
+                + ", message=" + virtualStickMessage;
+            if (dto.succeeded)
+            {
+                Debug.Log(statusLog);
+            }
+            else
+            {
+                Debug.LogError(statusLog);
+            }
             RenderStatus();
 
 #if UNITY_ANDROID && !UNITY_EDITOR
@@ -705,17 +885,36 @@ namespace QuestCommandCenter.Adapters.DjiSpark
             }
             try
             {
-                virtualStickStatusRequestPending = true;
-                androidBridge.CallStatic<bool>(
+                var requestId = ++virtualStickRequestSequence;
+                BeginVirtualStickRequest(requestId, "disable");
+                var accepted = androidBridge.CallStatic<bool>(
                     "requestVirtualStickMode",
                     false,
-                    ++virtualStickRequestSequence);
+                    requestId);
                 virtualStickEnabled = false;
+                virtualStickAvailable = false;
+                if (!accepted)
+                {
+                    FailVirtualStickRequestLocally(
+                        requestId,
+                        "disable",
+                        "DJI flight controller rejected the best-effort Virtual Stick disable request.");
+                    return;
+                }
                 Debug.LogWarning("Requested Virtual Stick disable because " + reason + ".");
             }
             catch (Exception exception)
             {
+                var requestId = virtualStickActiveRequestId;
+                if (requestId > 0)
+                {
+                    FailVirtualStickRequestLocally(
+                        requestId,
+                        "disable",
+                        "Best-effort Virtual Stick disable failed: " + exception.GetType().Name);
+                }
                 virtualStickEnabled = false;
+                virtualStickAvailable = false;
                 Debug.LogError("Could not request Virtual Stick disable: " + exception);
             }
         }
@@ -724,10 +923,17 @@ namespace QuestCommandCenter.Adapters.DjiSpark
         private void ResetVirtualStickStatus(string message)
         {
             var wasEnabled = virtualStickEnabled;
+            virtualStickLastCompletedRequestId = Math.Max(
+                virtualStickLastCompletedRequestId,
+                virtualStickActiveRequestId);
             virtualStickStatusRequestPending = false;
+            virtualStickActiveRequestId = 0;
+            virtualStickPendingOperation = string.Empty;
+            virtualStickRequestDeadline = 0.0;
             virtualStickStatusKnown = false;
             virtualStickAvailable = false;
             virtualStickEnabled = false;
+            virtualStickHasError = false;
             virtualStickMessage = message;
             if (wasEnabled)
             {
@@ -1515,6 +1721,7 @@ namespace QuestCommandCenter.Adapters.DjiSpark
         private sealed class DjiVirtualStickStatusDto
         {
             public long requestId;
+            public string operation;
             public bool succeeded;
             public bool available;
             public bool enabled;

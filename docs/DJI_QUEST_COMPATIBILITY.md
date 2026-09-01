@@ -251,7 +251,8 @@ telemetry, DJI failsafe, disconnect, or send failure. Development conversion
 limits are 1.0 m/s horizontal, 0.8 m/s vertical, and 30 degrees/s yaw before the
 stricter normalized Safety Manager limits are applied. No controller or UI path
 can bypass the integrated preflight and command arbiter. A one-shot ADB launch
-diagnostic remains available only for separately approved grounded verification.
+diagnostic remains available only for separately approved grounded verification;
+it is optional and is not required before an operator-directed outdoor test.
 
 The stationary, motors-off Spark test passed on 2026-08-28:
 
@@ -278,14 +279,55 @@ from the physical DJI controller and FPV remained live. The gate now requires a
 successful status getter before confirmation, then independently requires the
 enable callback and post-enable availability before entering `READY`.
 
+The 2026-08-31 field session reached all ten preflight checks with 94% battery,
+14 satellites, home set, `GPS_ATTI`, motors off, and fresh failsafe-clear
+telemetry. After the deliberate unlock chord and release, the asynchronous mode
+request failed about three seconds later. The application correctly remained
+locked and rejected the subsequent takeoff request. The affected build retained
+only the generic `STATUS QUERY FAILED` coordinator text: it received DJI's exact
+callback description in memory but omitted that description from both logcat and
+`events.jsonl`, so the original DJI error cannot be recovered after the process
+ended. This result does not disprove the earlier successful grounded lifecycle;
+it demonstrates a field-state or timing-dependent enable failure that needs a
+controlled reproduction with complete diagnostics.
+
+The 2026-09-01 diagnostic update corrects that failure path without relaxing a
+flight gate:
+
+- native and Unity logs now retain request ID, operation (`query`, `enable`, or
+  `disable`), callback latency, success, enabled/available states, numeric DJI
+  error code, error class/description, and telemetry age;
+- an enable failure no longer erases an earlier successful read-only probe or
+  masquerades as a status-query failure, so the operator can correct the cause
+  and deliberately repeat the unlock chord;
+- the 500 ms native command watchdog now starts when DJI's asynchronous enable
+  callback succeeds, rather than before the potentially multi-second SDK call;
+- missing callbacks expire in the Unity adapter, stale callbacks are ignored,
+  and an early failed read-only probe is retried at a bounded rate after fresh
+  flight telemetry arrives; and
+- the UI preflight freshness window now matches the adapter/native 500 ms enable
+  requirement and displays the exact last Virtual Stick error.
+
+DJI documents P-mode for Spark SDK control: on the Spark remote,
+`POSITION_TWO` (the switch position closest to the pilot) is P, while
+`POSITION_ONE` is Sport. It also documents enabled mode and command availability
+as separate states. The next enable attempt must therefore record the
+exact callback result and independently verify post-enable availability; it must
+not infer command readiness from a null callback alone.
+
+Sources: [DJI Remote Controller guide](https://developer.dji.com/mobile-sdk/documentation/introduction/component-guide-remotecontroller.html),
+[DJI Remote Controller `HardwareState` reference](https://developer.dji.com/api-reference/android-api/Components/RemoteController/DJIRemoteController_DJIRCHardwareState.html),
+and [DJI `FlightController` Virtual Stick reference](https://developer.dji.com/api-reference/android-api/Components/FlightController/DJIFlightController.html).
+
 The installed MSDK 4.18 artifacts were locally inspected with `javap` and confirm
 that `FlightController` exposes `startTakeoff`, `startLanding`, and `startGoHome`.
 The current development build wraps those three high-level calls behind a
 two-second hold, a separate A confirmation, fresh telemetry, per-action state
 checks, a five-second confirmation expiry, and duplicate native gates. It also
 uses `FlightControllerState.isHomeLocationSet()` as a mandatory RTH prerequisite.
-The bridge and APK compile successfully, but this flight-capable build has not yet
-been installed or exercised on the real aircraft. SDK acceptance and physical
+The bridge and APK compile successfully and the current flight-capable build is
+installed on Quest. Its guarded takeoff, landing, RTH, and airborne Virtual Stick
+paths have not yet completed an aircraft maneuver. SDK acceptance and physical
 maneuver completion are deliberately represented as different facts.
 
 ### 11. Unity Android native plugin

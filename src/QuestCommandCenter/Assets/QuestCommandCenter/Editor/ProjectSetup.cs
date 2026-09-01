@@ -410,6 +410,9 @@ namespace QuestCommandCenter.Editor
             var simulatorFlightActionCoordinator = diagnosticsObject
                 .AddComponent<QuestCommandCenter.XRInput.QuestFlightActionCoordinator>();
             simulatorFlightActionCoordinator.Initialize(controllerInput, simulatorRelay);
+            // Retained only for compatibility with the launch-only shadow path.
+            // QuestManualFlightCoordinator is the single production authority.
+            simulatorFlightActionCoordinator.enabled = false;
             var manualFlightCoordinator = diagnosticsObject
                 .AddComponent<QuestCommandCenter.XRInput.QuestManualFlightCoordinator>();
             manualFlightCoordinator.Initialize(

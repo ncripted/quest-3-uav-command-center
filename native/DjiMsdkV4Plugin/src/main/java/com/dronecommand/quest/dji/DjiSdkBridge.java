@@ -496,6 +496,7 @@ public final class DjiSdkBridge {
                         final boolean modeEnabled = Boolean.TRUE.equals(enabled);
                         emitVirtualStickStatus(
                             requestId,
+                            "query",
                             true,
                             available,
                             modeEnabled,
@@ -508,6 +509,7 @@ public final class DjiSdkBridge {
                     public void onFailure(DJIError error) {
                         emitVirtualStickStatus(
                             requestId,
+                            "query",
                             false,
                             available,
                             false,
@@ -519,6 +521,7 @@ public final class DjiSdkBridge {
             Log.e(TAG, "Virtual Stick status probe failed", throwable);
             emitVirtualStickStatus(
                 requestId,
+                "query",
                 false,
                 available,
                 false,
@@ -528,8 +531,8 @@ public final class DjiSdkBridge {
     }
 
     /**
-     * Guarded lifecycle entry point. No production controller currently invokes
-     * this method; it is present for the separately approved hardware test.
+     * Guarded lifecycle entry point. The command-center controller invokes this
+     * only after its deliberate preflight/unlock sequence has completed.
      */
     public static boolean requestVirtualStickMode(final boolean enabled, final long requestId) {
         final FlightController flightController;
@@ -586,6 +589,19 @@ public final class DjiSdkBridge {
                         synchronized (virtualStickLock) {
                             virtualStickModeRequestPending = false;
                             virtualStickEnabled = succeeded && enabled;
+                            if (succeeded && enabled) {
+                                // Start the stale-command window only after DJI
+                                // finishes its asynchronous enable operation.
+                                // Starting it before the callback can make a
+                                // normal multi-second DJI response look stale on
+                                // the scheduler's very first tick.
+                                latestVirtualStickCommandAtMs = SystemClock.elapsedRealtime();
+                                latestVirtualStickAuthorized = false;
+                                latestVirtualStickRoll = 0.0f;
+                                latestVirtualStickPitch = 0.0f;
+                                latestVirtualStickYaw = 0.0f;
+                                latestVirtualStickVertical = 0.0f;
+                            }
                         }
                         if (succeeded && enabled) {
                             startVirtualStickScheduler();
@@ -594,6 +610,7 @@ public final class DjiSdkBridge {
                         }
                         emitVirtualStickStatus(
                             requestId,
+                            enabled ? "enable" : "disable",
                             succeeded,
                             flightController.isVirtualStickControlModeAvailable(),
                             succeeded && enabled,
@@ -612,6 +629,7 @@ public final class DjiSdkBridge {
             Log.e(TAG, "Virtual Stick mode change failed", throwable);
             emitVirtualStickStatus(
                 requestId,
+                enabled ? "enable" : "disable",
                 false,
                 false,
                 false,
@@ -978,9 +996,15 @@ public final class DjiSdkBridge {
     }
 
     private static String errorDescription(DJIError error) {
-        return error == null || error.getDescription() == null
-            ? "Unknown DJI camera error."
+        if (error == null) {
+            return "Unknown DJI error.";
+        }
+        final String description = error.getDescription() == null
+            ? "No description supplied."
             : error.getDescription();
+        return error.getClass().getSimpleName()
+            + " code=" + error.getErrorCode()
+            + " description=" + description;
     }
 
     private static void emitCameraCommand(
@@ -1039,6 +1063,7 @@ public final class DjiSdkBridge {
 
     private static void emitVirtualStickStatus(
             long requestId,
+            String operation,
             boolean succeeded,
             boolean available,
             boolean enabled,
@@ -1046,11 +1071,23 @@ public final class DjiSdkBridge {
         try {
             JSONObject payload = new JSONObject();
             payload.put("requestId", requestId);
+            payload.put("operation", operation == null ? "" : operation);
             payload.put("succeeded", succeeded);
             payload.put("available", available);
             payload.put("enabled", enabled);
             payload.put("message", message == null ? "" : message);
             payload.put("monotonicMilliseconds", SystemClock.elapsedRealtime());
+            final String logMessage = "Virtual Stick result: requestId=" + requestId
+                + ", operation=" + operation
+                + ", succeeded=" + succeeded
+                + ", available=" + available
+                + ", enabled=" + enabled
+                + ", message=" + (message == null ? "" : message);
+            if (succeeded) {
+                Log.i(TAG, logMessage);
+            } else {
+                Log.e(TAG, logMessage);
+            }
             UnityPlayer.UnitySendMessage(
                 unityReceiver,
                 "OnDjiVirtualStickStatus",

@@ -16,6 +16,8 @@ namespace QuestCommandCenter.VehicleCore
         /// </summary>
         bool IsManualControlInterfaceReady { get; }
         bool IsManualControlEnabled { get; }
+        string ManualControlStatusMessage { get; }
+        bool HasManualControlError { get; }
 
         event Action<bool> ManualControlModeChanged;
 

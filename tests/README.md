@@ -13,14 +13,15 @@ Planned suites:
 Hardware tests must declare prerequisites, physical effects, abort behavior, and
 whether propellers must be removed before the operator starts the test.
 
-Current automated coverage contains 42 `EditMode` tests. In addition to normalized
+Current automated coverage contains 73 `EditMode` tests. In addition to normalized
 commands, telemetry, camera, gimbal, and input mapping, the suite now verifies
 control-mode transitions, command expiry, authority epochs, immediate manual
 takeover neutralization, dead-man rejection, telemetry/controller freshness, and
-Indoor Development command/altitude limits. No hardware suite exists and normal
-test execution cannot initiate aircraft behavior.
+Indoor Development command/altitude limits. It also verifies that a failed DJI
+Virtual Stick enable preserves API reachability and its exact error message. No
+hardware suite exists and normal test execution cannot initiate aircraft behavior.
 
-Six of those Unity tests cover the standalone 3D simulator model: authorized
+Seven of those Unity tests cover the standalone 3D simulator model: authorized
 movement, stale/dead-man/brake neutralization, altitude/radius limits, takeoff,
 landing, and return-home completion.
 

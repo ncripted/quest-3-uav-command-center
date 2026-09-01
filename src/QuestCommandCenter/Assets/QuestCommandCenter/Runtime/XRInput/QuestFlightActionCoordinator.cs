@@ -37,6 +37,21 @@ namespace QuestCommandCenter.XRInput
             Subscribe();
         }
 
+        private void Start()
+        {
+            // QuestManualFlightCoordinator is the production single-authority
+            // route for both simulator and live-aircraft actions. Older generated
+            // scenes may still contain this legacy direct router; disable it
+            // before the first input Update so one gesture cannot be dispatched
+            // twice.
+            if (GetComponent<QuestManualFlightCoordinator>() != null)
+            {
+                Debug.Log(
+                    "Legacy simulator flight-action router disabled; integrated coordinator owns actions.");
+                enabled = false;
+            }
+        }
+
         private void OnDisable()
         {
             Unsubscribe();

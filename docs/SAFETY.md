@@ -180,6 +180,13 @@ additionally requires fresh flight telemetry, failsafe clear, motors off, and
 `isFlying=false`; its 2026-08-28 hardware run enabled the mode with neutral-only
 output and verified the automatic timeout disable.
 
+A failed mode-enable callback does not authorize control and does not erase an
+earlier successful read-only API probe. The aircraft remains locked, the exact
+DJI error is displayed and logged, and retry requires the operator to repeat the
+full deliberate unlock chord. The native stale-command timer begins only after a
+successful enable callback, preventing SDK callback latency from consuming the
+500 ms heartbeat window before Unity can acknowledge control.
+
 The hardware shadow mode is a separate, launch-only dry-run path. It reads live
 Spark telemetry and Quest controller input, then exercises the generic command
 arbiter, Indoor Development Safety Profile, stale-input handling, action

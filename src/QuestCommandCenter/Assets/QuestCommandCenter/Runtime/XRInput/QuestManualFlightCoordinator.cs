@@ -15,7 +15,9 @@ namespace QuestCommandCenter.XRInput
         IFlightActionControl
     {
         private const long CommandTimeoutMilliseconds = 250;
-        private const long TelemetryTimeoutMilliseconds = 1000;
+        // Match the stricter DJI adapter/native enable precondition so the UI
+        // cannot show 10/10 during a window the adapter will reject as stale.
+        private const long TelemetryTimeoutMilliseconds = 500;
         private const double DispatchIntervalSeconds = 0.05;
         private const double EnableRequestTimeoutSeconds = 5.0;
 
@@ -463,7 +465,10 @@ namespace QuestCommandCenter.XRInput
             }
             if (simulatorFlightActionCoordinatorBehaviour != null)
             {
-                simulatorFlightActionCoordinatorBehaviour.enabled = !selected;
+                // The integrated coordinator is the sole action authority in
+                // both contexts. Keep the legacy direct simulator router off,
+                // including after a live-aircraft disconnect.
+                simulatorFlightActionCoordinatorBehaviour.enabled = false;
             }
             if (inputSourceBehaviour is QuestControllerInput controllerInput)
             {
@@ -692,6 +697,8 @@ namespace QuestCommandCenter.XRInput
                     ? "PREFLIGHT — ENABLING CONTROL"
                     : awaitingControlRelease
                         ? "PREFLIGHT — RELEASE CONTROLS"
+                        : manualControl?.HasManualControlError == true
+                            ? "PREFLIGHT — DJI CONTROL ERROR"
                         : "PREFLIGHT — FLIGHT LOCKED";
                 builder.AppendLine("OUTDOOR FIELD PREFLIGHT — MOTORS LOCKED");
                 if (preflightResult == null)
@@ -706,6 +713,14 @@ namespace QuestCommandCenter.XRInput
                     {
                         builder.Append(check.Passed ? "[OK] " : "[--] ")
                             .Append(check.Label).Append("  ").AppendLine(check.Detail);
+                    }
+                    if (manualControl?.HasManualControlError == true)
+                    {
+                        builder.AppendLine("DJI VIRTUAL STICK ERROR");
+                        builder.AppendLine(CompactStatusDetail(
+                            manualControl.ManualControlStatusMessage));
+                        builder.AppendLine(
+                            "Correct the controller/link state, then repeat the unlock chord.");
                     }
                     if (preflightResult.Passed)
                     {
@@ -745,6 +760,17 @@ namespace QuestCommandCenter.XRInput
                 && Math.Abs(command.Pitch) <= tolerance
                 && Math.Abs(command.Yaw) <= tolerance
                 && Math.Abs(command.Vertical) <= tolerance;
+        }
+
+        private static string CompactStatusDetail(string value)
+        {
+            const int maximumLength = 220;
+            var compact = string.IsNullOrWhiteSpace(value)
+                ? "DJI did not provide an error description."
+                : value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+            return compact.Length <= maximumLength
+                ? compact
+                : compact.Substring(0, maximumLength - 3) + "...";
         }
 
         private static long MonotonicMilliseconds()
