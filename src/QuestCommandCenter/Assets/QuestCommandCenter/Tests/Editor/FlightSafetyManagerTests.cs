@@ -63,7 +63,8 @@ namespace QuestCommandCenter.VehicleCore.Tests
         {
             var manager = new FlightSafetyManager(new IndoorDevelopmentSafetyProfile());
             var context = Context();
-            context.TelemetryAgeMilliseconds = 1001;
+            context.TelemetryAgeMilliseconds =
+                FlightTelemetryFreshnessPolicy.MaximumAgeMilliseconds + 1;
 
             var decision = manager.Evaluate(
                 Envelope(new NormalizedFlightCommand(0.1f, 0f, 0f, 0f)),

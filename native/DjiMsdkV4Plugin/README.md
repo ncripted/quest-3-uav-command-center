@@ -24,7 +24,13 @@ read-only status getter. DJI availability is expected to be false before mode
 enable; the getter establishes API reachability, while enable success and
 post-enable availability establish command readiness. After the main app's explicit preflight, its entry points configure body-relative
 roll/pitch velocity, vertical velocity, and yaw angular velocity, then schedule
-DJI commands at 20 Hz. The native layer independently replaces input older than
+DJI commands at 20 Hz. Enable first establishes DJI's required aircraft-heading
+orientation. A DJI common-timeout result is reconciled against authoritative
+mode state and permits at most one delayed, state-safe retry for that same
+grounded request. A seven-second native deadline force-disables the mode if any
+orientation, enable, query, retry, or disable callback stalls. Explicit disable
+can preempt a pending enable, and lifecycle changes invalidate every late
+callback while issuing an idempotent best-effort disable. The native layer independently replaces input older than
 150 ms with neutral and disables Virtual Stick after 500 ms without a fresh
 heartbeat, on stale flight telemetry, DJI failsafe, disconnect, or send failure.
 The native freshness and failsafe checks remain independent of Unity state.

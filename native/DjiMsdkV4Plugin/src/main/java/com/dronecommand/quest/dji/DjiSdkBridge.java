@@ -23,6 +23,7 @@ import dji.common.camera.StorageState;
 import dji.common.error.DJIError;
 import dji.common.error.DJISDKError;
 import dji.common.flightcontroller.Attitude;
+import dji.common.flightcontroller.FlightOrientationMode;
 import dji.common.flightcontroller.FlightControllerState;
 import dji.common.flightcontroller.LocationCoordinate3D;
 import dji.common.flightcontroller.virtualstick.FlightControlData;
@@ -51,10 +52,20 @@ public final class DjiSdkBridge {
     private static final String TAG = "QuestDjiBridge";
     private static final long TELEMETRY_EMIT_INTERVAL_MS = 200L;
     private static final long GIMBAL_TELEMETRY_MAXIMUM_AGE_MS = 500L;
-    private static final long FLIGHT_ACTION_TELEMETRY_MAXIMUM_AGE_MS = 500L;
+    private static final long FLIGHT_ACTION_TELEMETRY_MAXIMUM_AGE_MS = 1500L;
     private static final long VIRTUAL_STICK_COMMAND_STALE_MS = 150L;
     private static final long VIRTUAL_STICK_DISABLE_TIMEOUT_MS = 500L;
     private static final long VIRTUAL_STICK_PERIOD_MS = 50L;
+    private static final long VIRTUAL_STICK_ENABLE_RETRY_DELAY_MS = 300L;
+    private static final long VIRTUAL_STICK_MODE_REQUEST_TIMEOUT_MS = 7000L;
+    private static final int VIRTUAL_STICK_MODE_PHASE_IDLE = 0;
+    private static final int VIRTUAL_STICK_MODE_PHASE_ORIENTATION = 1;
+    private static final int VIRTUAL_STICK_MODE_PHASE_SET = 2;
+    private static final int VIRTUAL_STICK_MODE_PHASE_QUERY = 3;
+    private static final int VIRTUAL_STICK_MODE_PHASE_RETRY_WAIT = 4;
+    private static final int VIRTUAL_STICK_MODE_PHASE_SAFETY_DISABLE = 5;
+    private static final int VIRTUAL_STICK_MODE_PHASE_WATCHDOG_DISABLE = 6;
+    private static final long VIRTUAL_STICK_SAFETY_DISABLE_TIMEOUT_MS = 2000L;
     private static final float VIRTUAL_STICK_MAX_HORIZONTAL_MPS = 1.0f;
     private static final float VIRTUAL_STICK_MAX_VERTICAL_MPS = 0.8f;
     private static final float VIRTUAL_STICK_MAX_YAW_DPS = 30.0f;
@@ -71,6 +82,7 @@ public final class DjiSdkBridge {
     private static final Object virtualStickLock = new Object();
     private static String unityReceiver;
     private static FlightController boundFlightController;
+    private static long flightControllerBindingGeneration;
     private static Battery boundBattery;
     private static Camera boundCamera;
     private static Gimbal boundGimbal;
@@ -108,8 +120,19 @@ public final class DjiSdkBridge {
     private static String activeFlightActionOperation;
     private static FlightController activeFlightActionController;
     private static ScheduledExecutorService virtualStickExecutor;
+    private static ScheduledExecutorService virtualStickModeExecutor;
     private static boolean virtualStickEnabled;
     private static boolean virtualStickModeRequestPending;
+    private static long nextVirtualStickModeRequestToken;
+    private static long activeVirtualStickModeRequestToken;
+    private static long activeVirtualStickModeRequestId;
+    private static boolean activeVirtualStickModeTargetEnabled;
+    private static FlightController activeVirtualStickModeController;
+    private static long activeVirtualStickModeControllerGeneration;
+    private static int activeVirtualStickModeAttempt;
+    private static int activeVirtualStickModePhase;
+    private static boolean activeVirtualStickEnableRetryUsed;
+    private static long activeVirtualStickOrientationSetAtMs;
     private static long latestVirtualStickSequence;
     private static long latestVirtualStickCommandAtMs;
     private static float latestVirtualStickRoll;
@@ -396,7 +419,7 @@ public final class DjiSdkBridge {
         if (flightStateAtMs <= 0L
                 || SystemClock.elapsedRealtime() - flightStateAtMs
                     > FLIGHT_ACTION_TELEMETRY_MAXIMUM_AGE_MS) {
-            Log.w(TAG, "Flight action rejected because flight telemetry is older than 500 ms");
+            Log.w(TAG, "Flight action rejected because flight telemetry is older than 1500 ms");
             return false;
         }
         if (flightState.isFailsafeEnabled()) {
@@ -538,38 +561,235 @@ public final class DjiSdkBridge {
         final FlightController flightController;
         final FlightControllerState flightState;
         final long flightStateAtMs;
+        final long controllerGeneration;
+        final long requestToken;
+        final long now = SystemClock.elapsedRealtime();
+        long preemptedEnableRequestId = 0L;
         synchronized (telemetryLock) {
             flightController = boundFlightController;
             flightState = latestFlightState;
             flightStateAtMs = latestFlightStateAtMs;
-        }
+            controllerGeneration = flightControllerBindingGeneration;
 
-        if (flightController == null || !flightController.isConnected() || requestId <= 0L) {
-            return false;
-        }
-        if (enabled
-                && (flightState == null
-                    || flightState.isFailsafeEnabled()
-                    || flightStateAtMs <= 0L
-                    || SystemClock.elapsedRealtime() - flightStateAtMs
-                        > FLIGHT_ACTION_TELEMETRY_MAXIMUM_AGE_MS)) {
-            Log.w(TAG, "Virtual Stick enable rejected because fresh safe flight state is unavailable");
-            return false;
-        }
-
-        synchronized (virtualStickLock) {
-            if (virtualStickModeRequestPending) {
+            if (flightController == null || !flightController.isConnected() || requestId <= 0L) {
                 return false;
             }
-            virtualStickModeRequestPending = true;
-            if (enabled) {
-                latestVirtualStickCommandAtMs = SystemClock.elapsedRealtime();
+            if (enabled && !isFreshSafeFlightState(flightState, flightStateAtMs, now)) {
+                Log.w(TAG, "Virtual Stick enable rejected because fresh safe flight state is unavailable");
+                return false;
+            }
+
+            synchronized (virtualStickLock) {
+                if (virtualStickModeRequestPending) {
+                    if (enabled
+                            || activeVirtualStickModeRequestToken == 0L
+                            || !activeVirtualStickModeTargetEnabled) {
+                        return false;
+                    }
+                    // An explicit disable is always allowed to preempt a hung
+                    // enable. The old token is invalidated before the disable
+                    // is dispatched, so all of its callbacks become stale.
+                    preemptedEnableRequestId = activeVirtualStickModeRequestId;
+                    clearActiveVirtualStickModeRequestLocked();
+                }
+                requestToken = nextVirtualStickModeRequestToken();
+                virtualStickModeRequestPending = true;
+                activeVirtualStickModeRequestToken = requestToken;
+                activeVirtualStickModeRequestId = requestId;
+                activeVirtualStickModeTargetEnabled = enabled;
+                activeVirtualStickModeController = flightController;
+                activeVirtualStickModeControllerGeneration = controllerGeneration;
+                activeVirtualStickModeAttempt = 1;
+                activeVirtualStickModePhase = enabled
+                    ? VIRTUAL_STICK_MODE_PHASE_ORIENTATION
+                    : VIRTUAL_STICK_MODE_PHASE_SET;
+                activeVirtualStickEnableRetryUsed = false;
+                activeVirtualStickOrientationSetAtMs = 0L;
+                virtualStickEnabled = false;
+                latestVirtualStickCommandAtMs = now;
                 latestVirtualStickAuthorized = false;
                 latestVirtualStickRoll = 0.0f;
                 latestVirtualStickPitch = 0.0f;
                 latestVirtualStickYaw = 0.0f;
                 latestVirtualStickVertical = 0.0f;
             }
+        }
+
+        // A new mode transition never inherits a movement scheduler or command.
+        // In particular, neither orientation setup nor a timeout retry can send
+        // Virtual Stick flight-control data.
+        stopVirtualStickScheduler();
+        if (preemptedEnableRequestId > 0L) {
+            emitVirtualStickStatus(
+                preemptedEnableRequestId,
+                "enable",
+                false,
+                false,
+                false,
+                "Virtual Stick enable was preempted by an explicit disable request.");
+        }
+        scheduleVirtualStickModeRequestWatchdog(
+            flightController,
+            controllerGeneration,
+            enabled,
+            requestId,
+            requestToken);
+        if (enabled) {
+            prepareVirtualStickEnable(flightController, controllerGeneration, requestId, requestToken, 1);
+        } else {
+            dispatchVirtualStickModeSet(
+                flightController,
+                controllerGeneration,
+                false,
+                requestId,
+                requestToken,
+                1);
+        }
+        return true;
+    }
+
+    private static void prepareVirtualStickEnable(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final long requestId,
+            final long requestToken,
+            final int attempt) {
+        final FlightControllerState flightState;
+        final long flightStateAtMs;
+        final long now = SystemClock.elapsedRealtime();
+        synchronized (telemetryLock) {
+            flightState = latestFlightState;
+            flightStateAtMs = latestFlightStateAtMs;
+        }
+        if (!isVirtualStickEnableContextValid(
+                flightController,
+                controllerGeneration,
+                flightState,
+                flightStateAtMs,
+                now)) {
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                true,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_ORIENTATION,
+                false,
+                "Virtual Stick enable stopped because the link or safe flight state changed.");
+            return;
+        }
+
+        if (flightState.getOrientationMode() == FlightOrientationMode.AIRCRAFT_HEADING) {
+            synchronized (virtualStickLock) {
+                if (!isActiveVirtualStickModeRequestLocked(
+                        flightController,
+                        controllerGeneration,
+                        true,
+                        requestId,
+                        requestToken,
+                        attempt,
+                        VIRTUAL_STICK_MODE_PHASE_ORIENTATION)) {
+                    return;
+                }
+                activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_SET;
+            }
+            dispatchVirtualStickModeSet(
+                flightController,
+                controllerGeneration,
+                true,
+                requestId,
+                requestToken,
+                attempt);
+            return;
+        }
+
+        try {
+            flightController.setFlightOrientationMode(
+                FlightOrientationMode.AIRCRAFT_HEADING,
+                new CommonCallbacks.CompletionCallback() {
+                    @Override
+                    public void onResult(DJIError error) {
+                        synchronized (virtualStickLock) {
+                            if (!isActiveVirtualStickModeRequestLocked(
+                                    flightController,
+                                    controllerGeneration,
+                                    true,
+                                    requestId,
+                                    requestToken,
+                                    attempt,
+                                    VIRTUAL_STICK_MODE_PHASE_ORIENTATION)) {
+                                Log.w(TAG, "Ignoring stale Virtual Stick orientation callback");
+                                return;
+                            }
+                            if (error == null) {
+                                activeVirtualStickOrientationSetAtMs = SystemClock.elapsedRealtime();
+                                activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_SET;
+                            }
+                        }
+                        if (error != null) {
+                            finishVirtualStickModeRequest(
+                                flightController,
+                                controllerGeneration,
+                                true,
+                                requestId,
+                                requestToken,
+                                attempt,
+                                VIRTUAL_STICK_MODE_PHASE_ORIENTATION,
+                                false,
+                                "Could not establish aircraft-heading orientation: "
+                                    + errorDescription(error));
+                            return;
+                        }
+                        dispatchVirtualStickModeSet(
+                            flightController,
+                            controllerGeneration,
+                            true,
+                            requestId,
+                            requestToken,
+                            attempt);
+                    }
+                });
+        } catch (Throwable throwable) {
+            Log.e(TAG, "Could not establish aircraft-heading orientation", throwable);
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                true,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_ORIENTATION,
+                false,
+                throwable.getClass().getSimpleName() + ": " + safeMessage(throwable));
+        }
+    }
+
+    private static void dispatchVirtualStickModeSet(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final boolean enabled,
+            final long requestId,
+            final long requestToken,
+            final int attempt) {
+        if (!isVirtualStickModeDispatchValid(
+                flightController,
+                controllerGeneration,
+                enabled,
+                requestId,
+                requestToken,
+                attempt)) {
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                enabled,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_SET,
+                false,
+                "Virtual Stick mode change stopped because its controller context changed.");
+            return;
         }
 
         try {
@@ -585,56 +805,801 @@ public final class DjiSdkBridge {
                 new CommonCallbacks.CompletionCallback() {
                     @Override
                     public void onResult(DJIError error) {
-                        final boolean succeeded = error == null;
-                        synchronized (virtualStickLock) {
-                            virtualStickModeRequestPending = false;
-                            virtualStickEnabled = succeeded && enabled;
-                            if (succeeded && enabled) {
-                                // Start the stale-command window only after DJI
-                                // finishes its asynchronous enable operation.
-                                // Starting it before the callback can make a
-                                // normal multi-second DJI response look stale on
-                                // the scheduler's very first tick.
-                                latestVirtualStickCommandAtMs = SystemClock.elapsedRealtime();
-                                latestVirtualStickAuthorized = false;
-                                latestVirtualStickRoll = 0.0f;
-                                latestVirtualStickPitch = 0.0f;
-                                latestVirtualStickYaw = 0.0f;
-                                latestVirtualStickVertical = 0.0f;
+                        if (!isActiveVirtualStickModeRequest(
+                                flightController,
+                                controllerGeneration,
+                                enabled,
+                                requestId,
+                                requestToken,
+                                attempt,
+                                VIRTUAL_STICK_MODE_PHASE_SET)) {
+                            Log.w(TAG, "Ignoring stale Virtual Stick mode callback");
+                            if (enabled) {
+                                forceDisableAfterStaleEnable(
+                                    flightController,
+                                    "stale Virtual Stick enable callback");
                             }
+                            return;
                         }
-                        if (succeeded && enabled) {
-                            startVirtualStickScheduler();
-                        } else if (!enabled || !succeeded) {
-                            stopVirtualStickScheduler();
+                        if (enabled && isCommonTimeout(error)) {
+                            reconcileVirtualStickEnableTimeout(
+                                flightController,
+                                controllerGeneration,
+                                requestId,
+                                requestToken,
+                                attempt);
+                            return;
                         }
-                        emitVirtualStickStatus(
+                        finishVirtualStickModeRequest(
+                            flightController,
+                            controllerGeneration,
+                            enabled,
                             requestId,
-                            enabled ? "enable" : "disable",
-                            succeeded,
-                            flightController.isVirtualStickControlModeAvailable(),
-                            succeeded && enabled,
-                            succeeded
+                            requestToken,
+                            attempt,
+                            VIRTUAL_STICK_MODE_PHASE_SET,
+                            error == null,
+                            error == null
                                 ? (enabled ? "Virtual Stick mode enabled." : "Virtual Stick mode disabled.")
                                 : "Virtual Stick mode change failed: " + errorDescription(error));
                     }
                 });
+        } catch (Throwable throwable) {
+            Log.e(TAG, "Virtual Stick mode change failed", throwable);
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                enabled,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_SET,
+                false,
+                throwable.getClass().getSimpleName() + ": " + safeMessage(throwable));
+        }
+    }
+
+    private static void reconcileVirtualStickEnableTimeout(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final long requestId,
+            final long requestToken,
+            final int attempt) {
+        synchronized (virtualStickLock) {
+            if (!isActiveVirtualStickModeRequestLocked(
+                    flightController,
+                    controllerGeneration,
+                    true,
+                    requestId,
+                    requestToken,
+                    attempt,
+                    VIRTUAL_STICK_MODE_PHASE_SET)) {
+                return;
+            }
+            activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_QUERY;
+        }
+
+        Log.w(TAG, "Virtual Stick enable timed out; reconciling authoritative mode state");
+        try {
+            flightController.getVirtualStickModeEnabled(
+                new CommonCallbacks.CompletionCallbackWith<Boolean>() {
+                    @Override
+                    public void onSuccess(Boolean enabled) {
+                        if (!isActiveVirtualStickModeRequest(
+                                flightController,
+                                controllerGeneration,
+                                true,
+                                requestId,
+                                requestToken,
+                                attempt,
+                                VIRTUAL_STICK_MODE_PHASE_QUERY)) {
+                            Log.w(TAG, "Ignoring stale Virtual Stick reconciliation callback");
+                            return;
+                        }
+                        if (Boolean.TRUE.equals(enabled)) {
+                            finishVirtualStickModeRequest(
+                                flightController,
+                                controllerGeneration,
+                                true,
+                                requestId,
+                                requestToken,
+                                attempt,
+                                VIRTUAL_STICK_MODE_PHASE_QUERY,
+                                true,
+                                "Virtual Stick enable timed out, but authoritative state confirms it is enabled.");
+                            return;
+                        }
+                        scheduleVirtualStickEnableRetry(
+                            flightController,
+                            controllerGeneration,
+                            requestId,
+                            requestToken,
+                            attempt);
+                    }
+
+                    @Override
+                    public void onFailure(DJIError error) {
+                        finishVirtualStickModeRequest(
+                            flightController,
+                            controllerGeneration,
+                            true,
+                            requestId,
+                            requestToken,
+                            attempt,
+                            VIRTUAL_STICK_MODE_PHASE_QUERY,
+                            false,
+                            "Virtual Stick timeout reconciliation failed: " + errorDescription(error));
+                    }
+                });
+        } catch (Throwable throwable) {
+            Log.e(TAG, "Virtual Stick timeout reconciliation failed", throwable);
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                true,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_QUERY,
+                false,
+                throwable.getClass().getSimpleName() + ": " + safeMessage(throwable));
+        }
+    }
+
+    private static void scheduleVirtualStickEnableRetry(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final long requestId,
+            final long requestToken,
+            final int attempt) {
+        final int retryAttempt = attempt + 1;
+        final boolean retryAlreadyUsed;
+        synchronized (virtualStickLock) {
+            if (!isActiveVirtualStickModeRequestLocked(
+                    flightController,
+                    controllerGeneration,
+                    true,
+                    requestId,
+                    requestToken,
+                    attempt,
+                    VIRTUAL_STICK_MODE_PHASE_QUERY)) {
+                return;
+            }
+            retryAlreadyUsed = activeVirtualStickEnableRetryUsed;
+            if (!retryAlreadyUsed) {
+                activeVirtualStickEnableRetryUsed = true;
+                activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_RETRY_WAIT;
+            }
+        }
+        if (retryAlreadyUsed) {
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                true,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_QUERY,
+                false,
+                "Virtual Stick remained disabled after its single timeout retry.");
+            return;
+        }
+
+        try {
+            virtualStickModeExecutor().schedule(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!prepareVirtualStickRetry(
+                                flightController,
+                                controllerGeneration,
+                                requestId,
+                                requestToken,
+                                attempt,
+                                retryAttempt)) {
+                            return;
+                        }
+                        dispatchVirtualStickModeSet(
+                            flightController,
+                            controllerGeneration,
+                            true,
+                            requestId,
+                            requestToken,
+                            retryAttempt);
+                    }
+                },
+                VIRTUAL_STICK_ENABLE_RETRY_DELAY_MS,
+                TimeUnit.MILLISECONDS);
+        } catch (Throwable throwable) {
+            Log.e(TAG, "Could not schedule Virtual Stick enable retry", throwable);
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                true,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_RETRY_WAIT,
+                false,
+                throwable.getClass().getSimpleName() + ": " + safeMessage(throwable));
+        }
+    }
+
+    private static boolean prepareVirtualStickRetry(
+            FlightController flightController,
+            long controllerGeneration,
+            long requestId,
+            long requestToken,
+            int previousAttempt,
+            int retryAttempt) {
+        final FlightControllerState flightState;
+        final long flightStateAtMs;
+        final long orientationSetAtMs;
+        synchronized (telemetryLock) {
+            flightState = latestFlightState;
+            flightStateAtMs = latestFlightStateAtMs;
+            synchronized (virtualStickLock) {
+                if (!isActiveVirtualStickModeRequestLocked(
+                        flightController,
+                        controllerGeneration,
+                        true,
+                        requestId,
+                        requestToken,
+                        previousAttempt,
+                        VIRTUAL_STICK_MODE_PHASE_RETRY_WAIT)) {
+                    return false;
+                }
+                orientationSetAtMs = activeVirtualStickOrientationSetAtMs;
+                if (!isVirtualStickEnableContextValid(
+                        flightController,
+                        controllerGeneration,
+                        flightState,
+                        flightStateAtMs,
+                        SystemClock.elapsedRealtime())
+                        || !isAircraftHeadingEstablished(
+                            flightState,
+                            flightStateAtMs,
+                            orientationSetAtMs)) {
+                    // Leave the phase unchanged so the standard finalizer can
+                    // atomically reject this request below.
+                } else {
+                    activeVirtualStickModeAttempt = retryAttempt;
+                    activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_SET;
+                    return true;
+                }
+            }
+        }
+        finishVirtualStickModeRequest(
+            flightController,
+            controllerGeneration,
+            true,
+            requestId,
+            requestToken,
+            previousAttempt,
+            VIRTUAL_STICK_MODE_PHASE_RETRY_WAIT,
+            false,
+            "Virtual Stick retry cancelled because link, telemetry, failsafe, or orientation changed.");
+        return false;
+    }
+
+    private static boolean isFreshSafeFlightState(
+            FlightControllerState flightState,
+            long flightStateAtMs,
+            long now) {
+        return flightState != null
+            && !flightState.isFailsafeEnabled()
+            && !flightState.areMotorsOn()
+            && !flightState.isFlying()
+            && flightStateAtMs > 0L
+            && now - flightStateAtMs <= FLIGHT_ACTION_TELEMETRY_MAXIMUM_AGE_MS;
+    }
+
+    private static boolean isVirtualStickEnableContextValid(
+            FlightController flightController,
+            long controllerGeneration,
+            FlightControllerState flightState,
+            long flightStateAtMs,
+            long now) {
+        synchronized (telemetryLock) {
+            return boundFlightController == flightController
+                && flightControllerBindingGeneration == controllerGeneration
+                && flightController != null
+                && flightController.isConnected()
+                && isFreshSafeFlightState(latestFlightState, latestFlightStateAtMs, now);
+        }
+    }
+
+    private static boolean isAircraftHeadingEstablished(
+            FlightControllerState flightState,
+            long flightStateAtMs,
+            long orientationSetAtMs) {
+        return flightState != null
+            && (flightState.getOrientationMode() == FlightOrientationMode.AIRCRAFT_HEADING
+                || (orientationSetAtMs > 0L && flightStateAtMs <= orientationSetAtMs));
+    }
+
+    private static boolean isVirtualStickModeDispatchValid(
+            FlightController flightController,
+            long controllerGeneration,
+            boolean enabled,
+            long requestId,
+            long requestToken,
+            int attempt) {
+        synchronized (telemetryLock) {
+            final FlightControllerState flightState = latestFlightState;
+            final long flightStateAtMs = latestFlightStateAtMs;
+            final boolean controllerValid = boundFlightController == flightController
+                && flightControllerBindingGeneration == controllerGeneration
+                && flightController != null
+                && flightController.isConnected();
+            synchronized (virtualStickLock) {
+                if (!isActiveVirtualStickModeRequestLocked(
+                        flightController,
+                        controllerGeneration,
+                        enabled,
+                        requestId,
+                        requestToken,
+                        attempt,
+                        VIRTUAL_STICK_MODE_PHASE_SET)) {
+                    return false;
+                }
+                return controllerValid
+                    && (!enabled
+                        || (isFreshSafeFlightState(
+                                flightState,
+                                flightStateAtMs,
+                                SystemClock.elapsedRealtime())
+                            && isAircraftHeadingEstablished(
+                                flightState,
+                                flightStateAtMs,
+                                activeVirtualStickOrientationSetAtMs)));
+            }
+        }
+    }
+
+    private static boolean isActiveVirtualStickModeRequest(
+            FlightController flightController,
+            long controllerGeneration,
+            boolean enabled,
+            long requestId,
+            long requestToken,
+            int attempt,
+            int phase) {
+        synchronized (virtualStickLock) {
+            return isActiveVirtualStickModeRequestLocked(
+                flightController,
+                controllerGeneration,
+                enabled,
+                requestId,
+                requestToken,
+                attempt,
+                phase);
+        }
+    }
+
+    private static boolean isActiveVirtualStickModeRequestLocked(
+            FlightController flightController,
+            long controllerGeneration,
+            boolean enabled,
+            long requestId,
+            long requestToken,
+            int attempt,
+            int phase) {
+        return virtualStickModeRequestPending
+            && activeVirtualStickModeRequestToken == requestToken
+            && activeVirtualStickModeRequestId == requestId
+            && activeVirtualStickModeTargetEnabled == enabled
+            && activeVirtualStickModeController == flightController
+            && activeVirtualStickModeControllerGeneration == controllerGeneration
+            && activeVirtualStickModeAttempt == attempt
+            && activeVirtualStickModePhase == phase;
+    }
+
+    private static void finishVirtualStickModeRequest(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final boolean enabled,
+            final long requestId,
+            final long requestToken,
+            final int attempt,
+            final int expectedPhase,
+            final boolean succeeded,
+            final String message) {
+        boolean effectiveSuccess = succeeded;
+        boolean beginSafetyDisable = false;
+        String effectiveMessage = message;
+
+        synchronized (telemetryLock) {
+            final FlightControllerState flightState = latestFlightState;
+            final long flightStateAtMs = latestFlightStateAtMs;
+            final boolean controllerCurrent = boundFlightController == flightController
+                && flightControllerBindingGeneration == controllerGeneration
+                && flightController != null
+                && flightController.isConnected();
+            synchronized (virtualStickLock) {
+                if (!isActiveVirtualStickModeRequestLocked(
+                        flightController,
+                        controllerGeneration,
+                        enabled,
+                        requestId,
+                        requestToken,
+                        attempt,
+                        expectedPhase)) {
+                    return;
+                }
+
+                if (effectiveSuccess && !controllerCurrent) {
+                    effectiveSuccess = false;
+                    effectiveMessage = "Virtual Stick result ignored because the controller lifecycle changed.";
+                }
+                if (effectiveSuccess && enabled
+                        && (!isFreshSafeFlightState(
+                                flightState,
+                                flightStateAtMs,
+                                SystemClock.elapsedRealtime())
+                            || !isAircraftHeadingEstablished(
+                                flightState,
+                                flightStateAtMs,
+                                activeVirtualStickOrientationSetAtMs))) {
+                    effectiveSuccess = false;
+                    effectiveMessage = "Virtual Stick enable confirmation rejected because safe flight state or aircraft-heading orientation changed.";
+                    if (controllerCurrent) {
+                        activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_SAFETY_DISABLE;
+                        beginSafetyDisable = true;
+                    }
+                }
+
+                virtualStickEnabled = effectiveSuccess && enabled;
+                if (beginSafetyDisable) {
+                    latestVirtualStickAuthorized = false;
+                } else {
+                    clearActiveVirtualStickModeRequestLocked();
+                    if (effectiveSuccess && enabled) {
+                        // Start the stale-command window only after an accepted,
+                        // authoritative enable result.
+                        latestVirtualStickCommandAtMs = SystemClock.elapsedRealtime();
+                        latestVirtualStickAuthorized = false;
+                        latestVirtualStickRoll = 0.0f;
+                        latestVirtualStickPitch = 0.0f;
+                        latestVirtualStickYaw = 0.0f;
+                        latestVirtualStickVertical = 0.0f;
+                    }
+                }
+            }
+        }
+
+        stopVirtualStickScheduler();
+        if (beginSafetyDisable) {
+            dispatchVirtualStickSafetyDisable(
+                flightController,
+                controllerGeneration,
+                requestId,
+                requestToken,
+                attempt,
+                effectiveMessage);
+            return;
+        }
+        if (effectiveSuccess && enabled) {
+            startVirtualStickScheduler();
+        }
+        emitVirtualStickStatus(
+            requestId,
+            enabled ? "enable" : "disable",
+            effectiveSuccess,
+            safeVirtualStickAvailability(flightController),
+            effectiveSuccess && enabled,
+            effectiveMessage);
+    }
+
+    private static void dispatchVirtualStickSafetyDisable(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final long requestId,
+            final long requestToken,
+            final int attempt,
+            final String failureMessage) {
+        try {
+            flightController.setVirtualStickModeEnabled(
+                false,
+                new CommonCallbacks.CompletionCallback() {
+                    @Override
+                    public void onResult(DJIError error) {
+                        finishVirtualStickModeRequest(
+                            flightController,
+                            controllerGeneration,
+                            true,
+                            requestId,
+                            requestToken,
+                            attempt,
+                            VIRTUAL_STICK_MODE_PHASE_SAFETY_DISABLE,
+                            false,
+                            error == null
+                                ? failureMessage + " DJI mode was disabled for safety."
+                                : failureMessage + " Safety disable returned: " + errorDescription(error));
+                    }
+                });
+            virtualStickModeExecutor().schedule(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        finishVirtualStickModeRequest(
+                            flightController,
+                            controllerGeneration,
+                            true,
+                            requestId,
+                            requestToken,
+                            attempt,
+                            VIRTUAL_STICK_MODE_PHASE_SAFETY_DISABLE,
+                            false,
+                            failureMessage + " Safety-disable confirmation timed out.");
+                    }
+                },
+                VIRTUAL_STICK_SAFETY_DISABLE_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS);
+        } catch (Throwable throwable) {
+            Log.e(TAG, "Virtual Stick safety disable failed", throwable);
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                true,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_SAFETY_DISABLE,
+                false,
+                failureMessage + " Safety disable failed: " + safeMessage(throwable));
+        }
+    }
+
+    private static long nextVirtualStickModeRequestToken() {
+        nextVirtualStickModeRequestToken++;
+        if (nextVirtualStickModeRequestToken <= 0L) {
+            nextVirtualStickModeRequestToken = 1L;
+        }
+        return nextVirtualStickModeRequestToken;
+    }
+
+    private static ScheduledExecutorService virtualStickModeExecutor() {
+        synchronized (virtualStickLock) {
+            if (virtualStickModeExecutor == null || virtualStickModeExecutor.isShutdown()) {
+                virtualStickModeExecutor = Executors.newSingleThreadScheduledExecutor();
+            }
+            return virtualStickModeExecutor;
+        }
+    }
+
+    private static void scheduleVirtualStickModeRequestWatchdog(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final boolean enabled,
+            final long requestId,
+            final long requestToken) {
+        try {
+            virtualStickModeExecutor().schedule(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        expireVirtualStickModeRequest(
+                            flightController,
+                            controllerGeneration,
+                            enabled,
+                            requestId,
+                            requestToken,
+                            "Virtual Stick mode request exceeded its 7-second native deadline.");
+                    }
+                },
+                VIRTUAL_STICK_MODE_REQUEST_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS);
+        } catch (Throwable throwable) {
+            Log.e(TAG, "Could not schedule Virtual Stick mode watchdog", throwable);
+            expireVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                enabled,
+                requestId,
+                requestToken,
+                "Virtual Stick watchdog could not start: " + safeMessage(throwable));
+        }
+    }
+
+    private static void expireVirtualStickModeRequest(
+            FlightController flightController,
+            long controllerGeneration,
+            boolean enabled,
+            long requestId,
+            long requestToken,
+            String message) {
+        final int attempt;
+        synchronized (virtualStickLock) {
+            if (!virtualStickModeRequestPending
+                    || activeVirtualStickModeRequestToken != requestToken
+                    || activeVirtualStickModeRequestId != requestId
+                    || activeVirtualStickModeTargetEnabled != enabled
+                    || activeVirtualStickModeController != flightController
+                    || activeVirtualStickModeControllerGeneration != controllerGeneration) {
+                return;
+            }
+            activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_WATCHDOG_DISABLE;
+            attempt = activeVirtualStickModeAttempt;
+            virtualStickEnabled = false;
+            latestVirtualStickAuthorized = false;
+        }
+
+        stopVirtualStickScheduler();
+        // Keep the request pending until the idempotent disable callback or its
+        // own bounded timeout. This prevents a newer enable from racing ahead
+        // of the watchdog disable and being turned off by a late callback.
+        dispatchVirtualStickWatchdogDisable(
+            flightController,
+            controllerGeneration,
+            enabled,
+            requestId,
+            requestToken,
+            attempt,
+            message);
+    }
+
+    private static void dispatchVirtualStickWatchdogDisable(
+            final FlightController flightController,
+            final long controllerGeneration,
+            final boolean enabled,
+            final long requestId,
+            final long requestToken,
+            final int attempt,
+            final String message) {
+        try {
+            flightController.setVirtualStickModeEnabled(
+                false,
+                new CommonCallbacks.CompletionCallback() {
+                    @Override
+                    public void onResult(DJIError error) {
+                        finishVirtualStickModeRequest(
+                            flightController,
+                            controllerGeneration,
+                            enabled,
+                            requestId,
+                            requestToken,
+                            attempt,
+                            VIRTUAL_STICK_MODE_PHASE_WATCHDOG_DISABLE,
+                            false,
+                            error == null
+                                ? message + " DJI mode was disabled for safety."
+                                : message + " Safety disable returned: " + errorDescription(error));
+                    }
+                });
+            virtualStickModeExecutor().schedule(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        finishVirtualStickModeRequest(
+                            flightController,
+                            controllerGeneration,
+                            enabled,
+                            requestId,
+                            requestToken,
+                            attempt,
+                            VIRTUAL_STICK_MODE_PHASE_WATCHDOG_DISABLE,
+                            false,
+                            message + " Safety-disable confirmation timed out after 2 seconds.");
+                    }
+                },
+                VIRTUAL_STICK_SAFETY_DISABLE_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS);
+        } catch (Throwable throwable) {
+            Log.e(TAG, "Virtual Stick watchdog disable failed", throwable);
+            finishVirtualStickModeRequest(
+                flightController,
+                controllerGeneration,
+                enabled,
+                requestId,
+                requestToken,
+                attempt,
+                VIRTUAL_STICK_MODE_PHASE_WATCHDOG_DISABLE,
+                false,
+                message + " Safety disable failed: " + safeMessage(throwable));
+        }
+    }
+
+    private static void forceDisableAfterStaleEnable(
+            FlightController flightController,
+            String reason) {
+        synchronized (virtualStickLock) {
+            if (virtualStickEnabled
+                    || (virtualStickModeRequestPending
+                        && activeVirtualStickModeTargetEnabled)) {
+                return;
+            }
+        }
+        forceVirtualStickModeDisabled(flightController, reason);
+    }
+
+    private static boolean forceVirtualStickModeDisabled(
+            final FlightController flightController,
+            final String reason) {
+        if (flightController == null) {
+            return false;
+        }
+        try {
+            flightController.setVirtualStickModeEnabled(
+                false,
+                new CommonCallbacks.CompletionCallback() {
+                    @Override
+                    public void onResult(DJIError error) {
+                        if (error == null) {
+                            Log.i(TAG, "Best-effort Virtual Stick disable completed: " + reason);
+                        } else {
+                            Log.w(
+                                TAG,
+                                "Best-effort Virtual Stick disable returned an error ("
+                                    + reason + "): " + errorDescription(error));
+                        }
+                    }
+                });
             return true;
         } catch (Throwable throwable) {
-            synchronized (virtualStickLock) {
-                virtualStickModeRequestPending = false;
-                virtualStickEnabled = false;
+            Log.w(TAG, "Best-effort Virtual Stick disable could not be dispatched: " + reason, throwable);
+            return false;
+        }
+    }
+
+    private static boolean safeVirtualStickAvailability(FlightController flightController) {
+        try {
+            return flightController != null
+                && flightController.isConnected()
+                && flightController.isVirtualStickControlModeAvailable();
+        } catch (Throwable throwable) {
+            return false;
+        }
+    }
+
+    private static boolean isCommonTimeout(DJIError error) {
+        return error != null
+            && (error == DJIError.COMMON_TIMEOUT
+                || error.getErrorCode() == DJIError.COMMON_TIMEOUT.getErrorCode());
+    }
+
+    private static void clearActiveVirtualStickModeRequestLocked() {
+        virtualStickModeRequestPending = false;
+        activeVirtualStickModeRequestToken = 0L;
+        activeVirtualStickModeRequestId = 0L;
+        activeVirtualStickModeTargetEnabled = false;
+        activeVirtualStickModeController = null;
+        activeVirtualStickModeControllerGeneration = 0L;
+        activeVirtualStickModeAttempt = 0;
+        activeVirtualStickModePhase = VIRTUAL_STICK_MODE_PHASE_IDLE;
+        activeVirtualStickEnableRetryUsed = false;
+        activeVirtualStickOrientationSetAtMs = 0L;
+    }
+
+    private static void cancelPendingVirtualStickModeForLifecycle(
+            FlightController flightController,
+            String message) {
+        long requestId = 0L;
+        boolean enabled = false;
+        boolean emitFailure = false;
+        synchronized (virtualStickLock) {
+            if (virtualStickModeRequestPending
+                    && activeVirtualStickModeRequestToken != 0L) {
+                requestId = activeVirtualStickModeRequestId;
+                enabled = activeVirtualStickModeTargetEnabled;
+                emitFailure = true;
             }
-            stopVirtualStickScheduler();
-            Log.e(TAG, "Virtual Stick mode change failed", throwable);
+            virtualStickEnabled = false;
+            clearActiveVirtualStickModeRequestLocked();
+        }
+        stopVirtualStickScheduler();
+        // Dispatch regardless of local enabled/pending flags. A disappearing
+        // lifecycle can race a successful remote enable whose callback never
+        // reached this process.
+        forceVirtualStickModeDisabled(flightController, "flight-controller lifecycle invalidation");
+        if (emitFailure) {
             emitVirtualStickStatus(
                 requestId,
                 enabled ? "enable" : "disable",
                 false,
                 false,
                 false,
-                throwable.getClass().getSimpleName() + ": " + safeMessage(throwable));
-            return true;
+                message);
         }
     }
 
@@ -1418,6 +2383,7 @@ public final class DjiSdkBridge {
         unbindReadOnlyTelemetry();
 
         synchronized (telemetryLock) {
+            flightControllerBindingGeneration++;
             boundFlightController = flightController;
             boundBattery = battery;
             boundCamera = camera;
@@ -1556,6 +2522,7 @@ public final class DjiSdkBridge {
             boundBattery = null;
             boundCamera = null;
             boundGimbal = null;
+            flightControllerBindingGeneration++;
             latestFlightState = null;
             latestFlightStateAtMs = 0L;
             latestBatteryState = null;
@@ -1570,7 +2537,9 @@ public final class DjiSdkBridge {
             gimbalStateObserved = false;
         }
 
-        disableVirtualStickForSafety(flightController, "flight controller disconnected or rebound");
+        cancelPendingVirtualStickModeForLifecycle(
+            flightController,
+            "Flight controller disconnected or was rebound while its mode request was pending.");
 
         try {
             if (flightController != null) {

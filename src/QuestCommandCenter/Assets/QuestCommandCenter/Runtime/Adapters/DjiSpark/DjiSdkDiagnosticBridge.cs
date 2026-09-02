@@ -23,8 +23,7 @@ namespace QuestCommandCenter.Adapters.DjiSpark
         private const int PreviewHeight = 360;
         private const double VideoPollIntervalSeconds = 0.1;
         private const double GimbalTelemetryMaximumAgeSeconds = 0.5;
-        private const double FlightActionTelemetryMaximumAgeSeconds = 0.5;
-        private const double VirtualStickRequestTimeoutSeconds = 4.0;
+        private const double VirtualStickRequestTimeoutSeconds = 10.0;
         private const double VirtualStickStatusProbeRetrySeconds = 2.0;
 #if UNITY_ANDROID && !UNITY_EDITOR
         private const string GroundedNeutralTestIntentExtra =
@@ -154,15 +153,26 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 return;
             }
 
-            var ageSeconds = now - lastTelemetryReceivedAt;
-            if (ageSeconds > 1.0 && !telemetryStale)
+            var nowMilliseconds = SecondsToMilliseconds(now);
+            var receivedAtMilliseconds = SecondsToMilliseconds(lastTelemetryReceivedAt);
+            if (!FlightTelemetryFreshnessPolicy.IsFresh(
+                    nowMilliseconds,
+                    receivedAtMilliseconds)
+                && !telemetryStale)
             {
                 telemetryStale = true;
+                var age = FlightTelemetryFreshnessPolicy.TryGetAgeMilliseconds(
+                    nowMilliseconds,
+                    receivedAtMilliseconds,
+                    out var ageMilliseconds)
+                    ? ageMilliseconds.ToString(CultureInfo.InvariantCulture)
+                    : "invalid";
                 Debug.LogWarning(
                     "DJI telemetry stream stale; ageMs="
-                    + Math.Round(ageSeconds * 1000.0, 0, MidpointRounding.AwayFromZero));
+                    + age);
                 sdkState = "TELEMETRY STALE";
-                diagnosticMessage = "No telemetry received for more than one second.";
+                diagnosticMessage =
+                    "No telemetry received within the 1500 ms flight-safety window.";
                 RenderStatus();
             }
 
@@ -516,7 +526,8 @@ namespace QuestCommandCenter.Adapters.DjiSpark
             {
                 virtualStickHasError = true;
                 virtualStickMessage =
-                    "Virtual Stick enable rejected: telemetry is older than 500 ms or DJI failsafe is active.";
+                    "Virtual Stick enable rejected: flight telemetry is older than 1500 ms, "
+                    + "missing, clock-invalid, or DJI failsafe is active.";
                 Debug.LogError(virtualStickMessage);
                 RenderStatus();
                 return false;
@@ -691,9 +702,20 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 || (virtualStickActiveRequestId == 0
                     && dto.requestId <= virtualStickLastCompletedRequestId))
             {
-                Debug.LogWarning(
+                Debug.LogError(
                     "Ignoring stale DJI Virtual Stick callback for request "
                     + dto.requestId + ".");
+#if UNITY_ANDROID && !UNITY_EDITOR
+                if (dto.enabled)
+                {
+                    // A timed-out enable may still complete inside DJI after
+                    // managed authority has been withdrawn. Always force it
+                    // back off; never adopt late authority.
+                    DisableVirtualStickBestEffort(
+                        "a stale callback reported Virtual Stick enabled",
+                        true);
+                }
+#endif
                 return;
             }
 
@@ -838,7 +860,8 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 yield break;
             }
 
-            var enableDeadline = Time.realtimeSinceStartupAsDouble + 5.0;
+            var enableDeadline = Time.realtimeSinceStartupAsDouble
+                + VirtualStickRequestTimeoutSeconds + 1.0;
             while (virtualStickStatusRequestPending
                 && Time.realtimeSinceStartupAsDouble < enableDeadline)
             {
@@ -877,10 +900,14 @@ namespace QuestCommandCenter.Adapters.DjiSpark
             RequestVirtualStickStatusProbe();
         }
 
-        private void DisableVirtualStickBestEffort(string reason)
+        private void DisableVirtualStickBestEffort(
+            string reason,
+            bool nativeReportedEnabled = false)
         {
-            if (!virtualStickEnabled || androidBridge == null)
+            if ((!virtualStickEnabled && !nativeReportedEnabled) || androidBridge == null)
             {
+                virtualStickEnabled = false;
+                virtualStickAvailable = false;
                 return;
             }
             try
@@ -1002,8 +1029,22 @@ namespace QuestCommandCenter.Adapters.DjiSpark
                 && LatestTelemetry?.HasFlightState == true
                 && telemetryReceiveCount > 0
                 && !telemetryStale
-                && Time.realtimeSinceStartupAsDouble - lastTelemetryReceivedAt
-                    <= FlightActionTelemetryMaximumAgeSeconds;
+                && FlightTelemetryFreshnessPolicy.IsFresh(
+                    SecondsToMilliseconds(Time.realtimeSinceStartupAsDouble),
+                    SecondsToMilliseconds(lastTelemetryReceivedAt));
+        }
+
+        private static long SecondsToMilliseconds(double seconds)
+        {
+            if (double.IsNaN(seconds)
+                || double.IsInfinity(seconds)
+                || seconds < 0.0
+                || seconds > long.MaxValue / 1000.0)
+            {
+                return -1;
+            }
+
+            return (long)(seconds * 1000.0);
         }
 
         private static string FlightActionWireName(FlightActionType action)

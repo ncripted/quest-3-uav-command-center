@@ -15,11 +15,8 @@ namespace QuestCommandCenter.XRInput
         IFlightActionControl
     {
         private const long CommandTimeoutMilliseconds = 250;
-        // Match the stricter DJI adapter/native enable precondition so the UI
-        // cannot show 10/10 during a window the adapter will reject as stale.
-        private const long TelemetryTimeoutMilliseconds = 500;
         private const double DispatchIntervalSeconds = 0.05;
-        private const double EnableRequestTimeoutSeconds = 5.0;
+        private const double EnableRequestTimeoutSeconds = 12.0;
 
         [SerializeField] private MonoBehaviour inputSourceBehaviour;
         [SerializeField] private MonoBehaviour liveTelemetrySourceBehaviour;
@@ -294,9 +291,13 @@ namespace QuestCommandCenter.XRInput
         private void DispatchSelectedCommand(long now)
         {
             var selected = arbiter.Select(now);
-            var telemetryAge = latestTelemetryAtMilliseconds < 0
-                ? long.MaxValue
-                : Math.Max(0, now - latestTelemetryAtMilliseconds);
+            if (!FlightTelemetryFreshnessPolicy.TryGetAgeMilliseconds(
+                    now,
+                    latestTelemetryAtMilliseconds,
+                    out var telemetryAge))
+            {
+                telemetryAge = long.MaxValue;
+            }
             var decision = safetyManager.Evaluate(
                 selected,
                 new FlightSafetyContext
@@ -554,13 +555,35 @@ namespace QuestCommandCenter.XRInput
         {
             return liveTelemetry?.IsConnected == true
                 && liveTelemetry.HasFlightState
-                && latestTelemetryAtMilliseconds >= 0
-                && now - latestTelemetryAtMilliseconds <= TelemetryTimeoutMilliseconds;
+                && FlightTelemetryFreshnessPolicy.IsFresh(
+                    now,
+                    latestTelemetryAtMilliseconds);
         }
 
         private void OnManualControlModeChanged(bool enabled)
         {
+            var enableWasExpected = enableRequestPending
+                && IsLiveVehicleSelected
+                && stateMachine.Current == ControlMode.Preflight
+                && preflightResult?.Passed == true
+                && IsTelemetryFresh(MonotonicMilliseconds())
+                && liveTelemetry?.FailsafeEnabled != true;
             enableRequestPending = false;
+            if (enabled && !enableWasExpected)
+            {
+                Debug.LogError(
+                    "Unexpected or late manual-control enable; sending neutral and disabling control.");
+                if (IsLiveVehicleSelected)
+                {
+                    EnterFailsafe("UNEXPECTED OR LATE MANUAL CONTROL ENABLE");
+                }
+                else
+                {
+                    DisableLiveControl("unexpected or late enable");
+                }
+                RenderStatus();
+                return;
+            }
             if (!enabled
                 && IsLiveVehicleSelected
                 && (stateMachine.Current == ControlMode.Ready

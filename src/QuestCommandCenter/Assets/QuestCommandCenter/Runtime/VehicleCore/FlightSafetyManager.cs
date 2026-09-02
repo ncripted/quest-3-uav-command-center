@@ -35,7 +35,8 @@ namespace QuestCommandCenter.VehicleCore
         public float MaxRelativeAltitudeMeters { get; set; } = 2f;
         public int CriticalBatteryPercent { get; set; } = 20;
         public long ControllerStaleTimeoutMilliseconds { get; set; } = 150;
-        public long TelemetryFailsafeTimeoutMilliseconds { get; set; } = 1000;
+        public long TelemetryFailsafeTimeoutMilliseconds { get; set; } =
+            FlightTelemetryFreshnessPolicy.MaximumAgeMilliseconds;
 
         public void Validate()
         {
